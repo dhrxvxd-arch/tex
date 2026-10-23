@@ -11,9 +11,9 @@
 typedef uint8_t u8;
 
 #define COLOR(hex) \
-  _parse_hex_pair(hex, 0), \
-  _parse_hex_pair(hex, 2), \
-  _parse_hex_pair(hex, 4)
+_parse_hex_pair(hex, 0), \
+_parse_hex_pair(hex, 2), \
+_parse_hex_pair(hex, 4)
 
 static const char* version  = "Tex version: v0.1.0\n";
 static const char* help     = "Tex:\n\t--help|-h\t\t\tHelp\n\t--version|-v\t\t\tVersion\n\t[filename]\t\t\tOpen file\n";
@@ -50,7 +50,7 @@ static inline const char* _parse_cmd_args(int argc, const char** argv) {
       fprintf(stderr, "%s", version);
       exit(EXIT_SUCCESS);
     } else
-      return argv[i];
+    return argv[i];
   }
 
   return NULL;
@@ -75,6 +75,8 @@ struct state_T {
   bool has_file;
   const char* filename;
   bool running;
+  size_t row_offset;
+  size_t col_offset;
   SDL_Window* window;
   SDL_Renderer* renderer;
   TTF_Font* font;
@@ -95,6 +97,11 @@ static void editor_core_dest(struct editor_core_T* core);
 
 static void tex_file_draw(struct state_T* state);
 static void tex_window_init(struct state_T* state);
+static size_t tex_cursor_row(struct state_T* state);
+static size_t tex_visible_rows(struct state_T* state);
+static size_t tex_total_rows(const struct str8* buffer);
+static int tex_cursor_x(struct state_T* state);
+static void tex_scroll_horizontal(struct state_T* state);
 static void tex_cursor_draw(struct state_T* state);
 static void tex_input_handle(struct state_T* state, const SDL_Event* event);
 static void tex_render(struct state_T* state);
@@ -136,7 +143,7 @@ static void tex_file_draw(struct state_T* state) {
 
   size_t file_size = (size_t)end;
   if (file_size > SIZE_MAX - 1 ||
-      !string8_reserve(&state->core->buffer, file_size + 1)) {
+    !string8_reserve(&state->core->buffer, file_size + 1)) {
     fprintf(stderr, "tex: cannot allocate buffer for '%s'\n", state->filename);
     fclose(fp);
     exit(EXIT_FAILURE);
@@ -206,7 +213,7 @@ static bool string8_insert(struct str8* string, u8 val, size_t pos) {
     return false;
 
   if (string->size > SIZE_MAX - 2 ||
-      !string8_reserve(string, string->size + 2))
+    !string8_reserve(string, string->size + 2))
     return false;
 
   memmove(
@@ -312,43 +319,116 @@ static void tex_move_vertical(struct editor_core_T* core, int direction) {
   core->cur_pos = target_start +
     (target_column < target_length ? target_column : target_length);
 }
+static size_t tex_cursor_row(struct state_T* state) {
+  size_t row = 0;
 
-static void tex_cursor_draw(struct state_T* state) {
+  for (size_t i = 0; i < state->core->cur_pos; i++) {
+    if (state->core->buffer.data[i] == '\n')
+      row++;
+  }
+
+  return row;
+}
+
+static size_t tex_visible_rows(struct state_T* state) {
+  int width, height;
+  SDL_GetRendererOutputSize(state->renderer, &width, &height);
+
+  int line_height = TTF_FontLineSkip(state->font);
+  int available = height - 2 * padding_y;
+
+  if (line_height <= 0 || available <= 0)
+    return 1;
+
+  size_t rows = (size_t)(available / line_height);
+  return rows > 0 ? rows : 1;
+}
+
+static size_t tex_total_rows(const struct str8* buffer) {
+  size_t rows = 1;
+
+  for (size_t i = 0; i < buffer->size; i++) {
+    if (buffer->data[i] == '\n')
+      rows++;
+  }
+
+  return rows;
+}
+
+static int tex_cursor_x(struct state_T* state) {
   struct editor_core_T* core = state->core;
   struct str8* buffer = &core->buffer;
 
-  size_t line_start = tex_line_start(buffer, core->cur_pos);
-  size_t prefix_len = core->cur_pos - line_start;
+  size_t start = tex_line_start(buffer, core->cur_pos);
+  size_t len = core->cur_pos - start;
 
-  int text_w = 0;
+  if (len == 0)
+    return 0;
 
-  if (prefix_len > 0) {
-    char* prefix = malloc((prefix_len + 1) * sizeof(*prefix));
+  char* prefix = malloc(len + 1);
 
-    if (prefix == NULL) {
-      fprintf(stderr, "tex: cannot allocate cursor prefix\n");
-      exit(EXIT_FAILURE);
-    }
-
-    memcpy(prefix, buffer->data + line_start, prefix_len);
-    prefix[prefix_len] = '\0';
-
-    if (TTF_SizeUTF8(state->font, prefix, &text_w, NULL) < 0)
-      text_w = 0;
-
-    free(prefix);
+  if (prefix == NULL) {
+    fprintf(stderr, "tex: cannot allocate cursor prefix\n");
+    exit(EXIT_FAILURE);
   }
 
-  int cursor_x = padding_x + text_w;
-  int cursor_y = padding_y;
-  int line_height = TTF_FontLineSkip(state->font);
+  memcpy(prefix, buffer->data + start, len);
+  prefix[len] = '\0';
+
+  int width = 0;
+
+  if (TTF_SizeUTF8(state->font, prefix, &width, NULL) < 0)
+    width = 0;
+
+  free(prefix);
+  return width;
+}
+
+static void tex_scroll_horizontal(struct state_T* state) {
+  int width, height;
+  SDL_GetRendererOutputSize(state->renderer, &width, &height);
+
+  int available_width = width - 2 * padding_x;
+  if (available_width <= 0)
+    return;
+
+  int cursor_x = tex_cursor_x(state);
+
+  if ((size_t)cursor_x < state->col_offset) {
+    state->col_offset = cursor_x;
+  } else if ((size_t)cursor_x >= state->col_offset + available_width) {
+    state->col_offset = cursor_x - available_width + 1;
+  }
+}
+
+static void tex_scroll(struct state_T* state) {
+  size_t cursor_row = tex_cursor_row(state);
+  size_t visible_rows = tex_visible_rows(state);
+
+  if (cursor_row < state->row_offset) {
+    state->row_offset = cursor_row;
+  } else if (cursor_row >= state->row_offset + visible_rows) {
+    state->row_offset = cursor_row - visible_rows + 1;
+  }
+}
+static void tex_cursor_draw(struct state_T* state) {
+  int cursor_x = padding_x + tex_cursor_x(state) - state->col_offset;
   int cursor_h = TTF_FontHeight(state->font);
+  size_t cursor_row = tex_cursor_row(state);
 
-  for (size_t i = 0; i < line_start; i++) {
-    if (buffer->data[i] == '\n')
-      cursor_y += line_height;
-  }
+  size_t visible_rows = tex_visible_rows(state);
 
+  if (cursor_row < state->row_offset ||
+      cursor_row - state->row_offset >= visible_rows)
+    return;
+
+  int cursor_y = padding_y + (int)(cursor_row - state->row_offset) *
+    TTF_FontLineSkip(state->font);
+  int width, height;
+  SDL_GetRendererOutputSize(state->renderer, &width, &height);
+
+  if (cursor_x < padding_x || cursor_x >= width - padding_x)
+    return;
   SDL_SetRenderDrawColor(state->renderer, 196, 167, 231, 255);
 
   SDL_RenderDrawLine(
@@ -443,6 +523,8 @@ static void tex_input_handle(struct state_T* state, const SDL_Event* event) {
     }
 
     core->preferred_col_valid = false;
+    tex_scroll(state);
+    tex_scroll_horizontal(state);
     return;
   }
 
@@ -452,7 +534,7 @@ static void tex_input_handle(struct state_T* state, const SDL_Event* event) {
   switch (event->key.keysym.sym) {
     case SDLK_BACKSPACE: {
       if (core->cur_pos > 0 &&
-          string8_delete(buffer, core->cur_pos - 1))
+        string8_delete(buffer, core->cur_pos - 1))
         core->cur_pos--;
 
       core->preferred_col_valid = false;
@@ -517,27 +599,45 @@ static void tex_input_handle(struct state_T* state, const SDL_Event* event) {
     default:
       break;
   }
+  core->preferred_col_valid = false;
+  tex_scroll(state);
+  tex_scroll_horizontal(state);
 }
 
 static void tex_render(struct state_T* state) {
   struct str8* buffer = &state->core->buffer;
 
   SDL_Color fg = { COLOR(colors[FG]), 255 };
+
   int line_y = padding_y;
   int line_height = TTF_FontLineSkip(state->font);
   size_t start = 0;
+  size_t row = 0;
+  size_t visible_rows = tex_visible_rows(state);
 
-  SDL_SetRenderDrawColor(state->renderer, COLOR(colors[BG]), 255);
+  SDL_SetRenderDrawColor(
+    state->renderer, COLOR(colors[BG]), 255
+  );
   SDL_RenderClear(state->renderer);
 
-  for (size_t i = 0; i <= buffer->size; i++) {
-    if (i != buffer->size && buffer->data[i] != '\n')
-      continue;
+  while (start < buffer->size && row < state->row_offset) {
+    if (buffer->data[start++] == '\n')
+      row++;
+  }
 
-    size_t len = i - start;
+  size_t end = start;
+
+  while (row < state->row_offset + visible_rows &&
+    end <= buffer->size) {
+    if (end < buffer->size && buffer->data[end] != '\n') {
+      end++;
+      continue;
+    }
+
+    size_t len = end - start;
 
     if (len > 0) {
-      char* line = malloc((len + 1) * sizeof(*line));
+      char* line = malloc(len + 1);
 
       if (line == NULL) {
         fprintf(stderr, "tex: cannot allocate line buffer\n");
@@ -547,18 +647,18 @@ static void tex_render(struct state_T* state) {
       memcpy(line, buffer->data + start, len);
       line[len] = '\0';
 
-      SDL_Surface* surface = TTF_RenderUTF8_Blended(state->font, line, fg);
+      SDL_Surface* surface =
+        TTF_RenderUTF8_Blended(state->font, line, fg);
+
       free(line);
 
       if (surface != NULL) {
-        SDL_Texture* texture = SDL_CreateTextureFromSurface(
-          state->renderer,
-          surface
-        );
+        SDL_Texture* texture =
+          SDL_CreateTextureFromSurface(state->renderer, surface);
 
         if (texture != NULL) {
           SDL_Rect dest = {
-            .x = padding_x,
+            .x = padding_x - state->col_offset,
             .y = line_y,
             .w = surface->w,
             .h = surface->h
@@ -573,7 +673,13 @@ static void tex_render(struct state_T* state) {
     }
 
     line_y += line_height;
-    start = i + 1;
+    row++;
+
+    if (end == buffer->size)
+      break;
+
+    start = end + 1;
+    end = start;
   }
 
   tex_cursor_draw(state);
@@ -587,19 +693,47 @@ static void tex_window_loop(struct state_T* state) {
   while (state->running) {
     if (SDL_WaitEventTimeout(&event, 16)) {
       do {
-      switch (event.type) {
-        case SDL_QUIT: {
-          state->running = false;
-        } break;
+        switch (event.type) {
+          case SDL_QUIT: {
+            state->running = false;
+          } break;
 
-        case SDL_KEYDOWN:
-        case SDL_TEXTINPUT: {
-          tex_input_handle(state, &event);
-        } break;
+          case SDL_KEYDOWN:
+          case SDL_TEXTINPUT: {
+            tex_input_handle(state, &event);
+          } break;
 
-        default:
-          break;
-      }
+          case SDL_MOUSEWHEEL: {
+            int direction = event.wheel.y;
+
+            if (event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED)
+              direction = -direction;
+
+            size_t visible_rows = tex_visible_rows(state);
+            size_t total_rows = tex_total_rows(&state->core->buffer);
+            size_t max_offset = total_rows > visible_rows
+              ? total_rows - visible_rows
+              : 0;
+
+            if (state->row_offset > max_offset)
+              state->row_offset = max_offset;
+
+            size_t amount = (size_t)(direction < 0 ? -direction : direction) * 3;
+
+            if (direction > 0) {
+              state->row_offset = amount > state->row_offset
+                ? 0
+                : state->row_offset - amount;
+            } else if (direction < 0) {
+              state->row_offset = amount > max_offset - state->row_offset
+                ? max_offset
+                : state->row_offset + amount;
+            }
+          } break;
+
+          default:
+            break;
+        }
       } while (SDL_PollEvent(&event));
     }
 
@@ -631,6 +765,8 @@ int main(int argc, const char** argv) {
     .argc = argc,
     .argv = argv,
     .running = false,
+    .row_offset = 0,
+    .col_offset = 0,
     .window = NULL,
     .renderer = NULL,
     .font = NULL,
