@@ -16,7 +16,10 @@ typedef uint8_t u8;
   _parse_hex_pair(hex, 4)
 
 static const char* version  = "Tex version: v0.1.0\n";
-static const char* help     = "Tex:\n\t--help|-h\t\t\tHelp\n\t--version|-v\t\t\tVersion\n\t[filename]\t\t\tOpen file\n";
+static const char* help     = "Tex:\n\t"
+                              "--help|-h\t\t\tHelp\n\t"
+                              "--version|-v\t\t\tVersion\n\t"
+                              "[filename]\t\t\tOpen file\n";
 
 #define BG 1
 #define FG 2
@@ -63,16 +66,19 @@ struct str8 {
   size_t capacity;
 };
 
-enum editor_mode { MODE_NORMAL, MODE_INSERT };
+enum editor_mode { MODE_NORMAL, MODE_INSERT, MODE_COMMAND };
 
 struct editor_core_T {
   enum editor_mode mode;
   size_t count;
   bool pending_delete;
   bool suppress_text_input;
+  bool modified;
   size_t cur_pos;
   size_t preferred_col;
   bool preferred_col_valid;
+  char message[256];
+  struct str8 command;
   struct str8 buffer;
 };
 
@@ -81,6 +87,7 @@ struct state_T {
   const char** argv;
   bool has_file;
   const char* filename;
+  char save_name[4096];
   bool running;
   size_t row_offset;
   size_t col_offset;
@@ -108,6 +115,7 @@ static void editor_core_init(struct editor_core_T* core);
 static void editor_core_dest(struct editor_core_T* core);
 
 static void tex_file_draw(struct state_T* state);
+static bool tex_file_save(struct state_T* state, const char* filename);
 static void tex_window_init(struct state_T* state);
 static size_t tex_cursor_row(struct state_T* state);
 static size_t tex_visible_rows(struct state_T* state);
@@ -116,6 +124,13 @@ static int tex_cursor_x(struct state_T* state);
 static void tex_scroll_horizontal(struct state_T* state);
 static void tex_scroll(struct state_T* state);
 static void tex_cursor_draw(struct state_T* state);
+static void tex_command_cursor_draw(struct state_T* state);
+static void tex_text_draw(struct state_T* state, const char* text, int x, int y, SDL_Color color);
+static void tex_status_draw(struct state_T* state);
+static char* tex_command_line(const struct editor_core_T* core);
+static bool tex_command_write(struct state_T* state, const char* arg);
+static void tex_command_execute(struct state_T* state);
+static void tex_command_input(struct state_T* state, SDL_Keycode key);
 static void tex_input_handle(struct state_T* state, const SDL_Event* event);
 static void tex_render(struct state_T* state);
 static void tex_window_loop(struct state_T* state);
@@ -183,6 +198,32 @@ static void tex_file_draw(struct state_T* state) {
   buffer->size = bytes_read;
   buffer->data[buffer->size] = '\0';
   state->core->cur_pos = 0;
+}
+
+static bool tex_file_save(struct state_T* state, const char* filename) {
+  struct editor_core_T* core = state->core;
+  struct str8* buffer = &core->buffer;
+
+  FILE* fp = fopen(filename, "wb");
+  if (fp == NULL) {
+    snprintf(core->message, sizeof(core->message),
+      "E212: Cannot open '%s' for writing", filename);
+    return false;
+  }
+
+  bool ok = fwrite(buffer->data, 1, buffer->size, fp) == buffer->size;
+  if (fclose(fp) != 0)
+    ok = false;
+
+  if (!ok) {
+    snprintf(core->message, sizeof(core->message),
+      "E514: Write error on '%s'", filename);
+    return false;
+  }
+
+  snprintf(core->message, sizeof(core->message),
+    "\"%s\" %zuB written", filename, buffer->size);
+  return true;
 }
 
 static void string8_init(struct str8* string) {
@@ -351,14 +392,18 @@ static void editor_core_init(struct editor_core_T* core) {
   core->count = 0;
   core->pending_delete = false;
   core->suppress_text_input = false;
+  core->modified = false;
   core->cur_pos = 0;
   core->preferred_col = 0;
   core->preferred_col_valid = false;
+  core->message[0] = '\0';
 
   string8_init(&core->buffer);
+  string8_init(&core->command);
 }
 
 static void editor_core_dest(struct editor_core_T* core) {
+  string8_dest(&core->command);
   string8_dest(&core->buffer);
 
   core->cur_pos = 0;
@@ -441,7 +486,7 @@ static size_t tex_visible_rows(struct state_T* state) {
   SDL_GetRendererOutputSize(state->renderer, &width, &height);
 
   int line_height = TTF_FontLineSkip(state->font);
-  int available = height - 2 * padding_y;
+  int available = height - 2 * padding_y - line_height;
 
   if (line_height <= 0 || available <= 0)
     return 1;
@@ -521,6 +566,11 @@ static void tex_scroll(struct state_T* state) {
 static void tex_cursor_draw(struct state_T* state) {
   struct editor_core_T* core = state->core;
   struct str8* buffer = &core->buffer;
+
+  if (core->mode == MODE_COMMAND) {
+    tex_command_cursor_draw(state);
+    return;
+  }
 
   size_t pos = core->cur_pos;
   size_t row = tex_cursor_row(state);
@@ -767,6 +817,7 @@ static void tex_delete_range(struct editor_core_T* core, size_t start, size_t en
   if (end > start) {
     memmove(b->data + start, b->data + end, b->size - end + 1);
     b->size -= end - start;
+    core->modified = true;
   }
   core->cur_pos = start;
   tex_normal_clamp(core);
@@ -778,9 +829,208 @@ static void tex_open_line(struct editor_core_T* core, bool below) {
   size_t end = tex_line_end(b, core->cur_pos);
   size_t pos = below ? end : start;
   if (!string8_insert(b, '\n', pos)) return;
+  core->modified = true;
   core->cur_pos = below ? pos + 1 : start;
   core->mode = MODE_INSERT;
   core->preferred_col_valid = false;
+}
+
+static char* tex_command_line(const struct editor_core_T* core) {
+  size_t len = core->command.size;
+  char* line = malloc(len + 2);
+
+  if (line == NULL) {
+    fprintf(stderr, "tex: cannot allocate command line\n");
+    exit(EXIT_FAILURE);
+  }
+
+  line[0] = ':';
+  memcpy(line + 1, core->command.data, len);
+  line[len + 1] = '\0';
+
+  return line;
+}
+
+static void tex_text_draw(
+  struct state_T* state,
+  const char* text,
+  int x,
+  int y,
+  SDL_Color color
+) {
+  SDL_Surface* surface = TTF_RenderUTF8_Blended(state->font, text, color);
+
+  if (surface == NULL)
+    return;
+
+  SDL_Texture* texture = SDL_CreateTextureFromSurface(state->renderer, surface);
+
+  if (texture != NULL) {
+    SDL_Rect dest = {
+      .x = x,
+      .y = y,
+      .w = surface->w,
+      .h = surface->h
+    };
+
+    SDL_RenderCopy(state->renderer, texture, NULL, &dest);
+    SDL_DestroyTexture(texture);
+  }
+
+  SDL_FreeSurface(surface);
+}
+
+static void tex_status_draw(struct state_T* state) {
+  struct editor_core_T* core = state->core;
+  SDL_Color fg = { COLOR(colors[FG]), 255 };
+
+  int width, height;
+  SDL_GetRendererOutputSize(state->renderer, &width, &height);
+
+  int y = height - padding_y - TTF_FontLineSkip(state->font);
+  char* line = NULL;
+  const char* text = core->message;
+
+  if (core->mode == MODE_COMMAND) {
+    line = tex_command_line(core);
+    text = line;
+  } else if (core->message[0] == '\0' && core->mode == MODE_INSERT) {
+    text = "-- INSERT --";
+  }
+
+  if (text[0] != '\0')
+    tex_text_draw(state, text, padding_x, y, fg);
+
+  free(line);
+}
+
+static void tex_command_cursor_draw(struct state_T* state) {
+  char* line = tex_command_line(state->core);
+  int w = 0;
+
+  if (TTF_SizeUTF8(state->font, line, &w, NULL) < 0)
+    w = 0;
+
+  free(line);
+
+  int width, height;
+  SDL_GetRendererOutputSize(state->renderer, &width, &height);
+
+  int h = TTF_FontLineSkip(state->font);
+  int x = padding_x + w;
+  int y = height - padding_y - h;
+
+  if (x >= width - padding_x)
+    return;
+
+  SDL_SetRenderDrawColor(state->renderer, 196, 167, 231, 255);
+  SDL_RenderDrawLine(state->renderer, x, y, x, y + h - 1);
+  SDL_RenderDrawLine(state->renderer, x + 1, y, x + 1, y + h - 1);
+}
+
+static bool tex_command_write(struct state_T* state, const char* arg) {
+  struct editor_core_T* core = state->core;
+  const char* target = arg[0] != '\0' ? arg : state->filename;
+
+  if (target == NULL) {
+    snprintf(core->message, sizeof(core->message), "E32: No file name");
+    return false;
+  }
+
+  if (!tex_file_save(state, target))
+    return false;
+
+  if (!state->has_file) {
+    snprintf(state->save_name, sizeof(state->save_name), "%s", target);
+    state->filename = state->save_name;
+    state->has_file = true;
+  }
+
+  if (!strcmp(target, state->filename))
+    core->modified = false;
+
+  return true;
+}
+
+static void tex_command_execute(struct state_T* state) {
+  struct editor_core_T* core = state->core;
+  char* cmd = (char*)core->command.data;
+
+  while (*cmd == ' ' || *cmd == '\t' || *cmd == ':')
+    cmd++;
+
+  char* arg = cmd;
+  while (*arg != '\0' && *arg != ' ' && *arg != '\t')
+    arg++;
+
+  if (*arg != '\0') {
+    *arg++ = '\0';
+    while (*arg == ' ' || *arg == '\t')
+      arg++;
+  }
+
+  if (cmd[0] == '\0')
+    return;
+
+  char* end = NULL;
+  unsigned long line = strtoul(cmd, &end, 10);
+
+  if (end != cmd && *end == '\0') {
+    size_t pos = 0;
+
+    for (unsigned long i = 1; i < line; i++) {
+      size_t line_end = tex_line_end(&core->buffer, pos);
+      if (line_end >= core->buffer.size)
+        break;
+      pos = line_end + 1;
+    }
+
+    core->cur_pos = pos;
+  } else if (!strcmp(cmd, "w") || !strcmp(cmd, "w!") || !strcmp(cmd, "write")) {
+    tex_command_write(state, arg);
+  } else if (!strcmp(cmd, "wq") || !strcmp(cmd, "x")) {
+    if (tex_command_write(state, arg))
+      state->running = false;
+  } else if (!strcmp(cmd, "q") || !strcmp(cmd, "quit")) {
+    if (core->modified)
+      snprintf(core->message, sizeof(core->message),
+        "E37: No write since last change (add ! to override)");
+    else
+      state->running = false;
+  } else if (!strcmp(cmd, "q!")) {
+    state->running = false;
+  } else {
+    snprintf(core->message, sizeof(core->message),
+      "E492: Not an editor command: %s", cmd);
+  }
+}
+
+static void tex_command_input(struct state_T* state, SDL_Keycode key) {
+  struct editor_core_T* core = state->core;
+  struct str8* command = &core->command;
+
+  switch (key) {
+    case SDLK_ESCAPE:
+      core->mode = MODE_NORMAL;
+      command->size = 0;
+      command->data[0] = '\0';
+      break;
+    case SDLK_BACKSPACE:
+      if (command->size == 0) {
+        core->mode = MODE_NORMAL;
+      } else {
+        command->size = utf8_prev(command, command->size);
+        command->data[command->size] = '\0';
+      }
+      break;
+    case SDLK_RETURN: case SDLK_KP_ENTER:
+      core->mode = MODE_NORMAL;
+      tex_command_execute(state);
+      command->size = 0;
+      command->data[0] = '\0';
+      break;
+    default: break;
+  }
 }
 
 static void tex_input_handle(struct state_T* state, const SDL_Event* event) {
@@ -789,14 +1039,22 @@ static void tex_input_handle(struct state_T* state, const SDL_Event* event) {
 
   if (event->type == SDL_TEXTINPUT) {
     if (core->suppress_text_input) { core->suppress_text_input = false; return; }
+    if (core->mode == MODE_COMMAND) {
+      const char* text = event->text.text;
+      if (!string8_insert_bytes(&core->command, (const u8*)text, strlen(text), core->command.size))
+        fprintf(stderr, "tex: failed to insert command text\n");
+      return;
+    }
     if (core->mode != MODE_INSERT || core->pending_delete || core->count)
       return;
     const char* text = event->text.text;
     size_t len = strlen(text);
-    if (string8_insert_bytes(buffer, (const u8*)text, len, core->cur_pos))
+    if (string8_insert_bytes(buffer, (const u8*)text, len, core->cur_pos)) {
       core->cur_pos += len;
-    else
+      core->modified = true;
+    } else {
       fprintf(stderr, "tex: failed to insert text\n");
+    }
     core->preferred_col_valid = false;
     tex_scroll(state);
     tex_scroll_horizontal(state);
@@ -807,6 +1065,10 @@ static void tex_input_handle(struct state_T* state, const SDL_Event* event) {
     return;
 
   SDL_Keycode key = event->key.keysym.sym;
+
+  if (core->mode != MODE_COMMAND)
+    core->message[0] = '\0';
+
   if (core->mode == MODE_INSERT) {
     switch (key) {
       case SDLK_ESCAPE:
@@ -836,16 +1098,22 @@ static void tex_input_handle(struct state_T* state, const SDL_Event* event) {
       case SDLK_HOME: core->cur_pos = tex_line_start(buffer, core->cur_pos); break;
       case SDLK_END: core->cur_pos = tex_line_end(buffer, core->cur_pos); break;
       case SDLK_RETURN: case SDLK_KP_ENTER:
-        if (string8_insert(buffer, '\n', core->cur_pos)) core->cur_pos++;
+        if (string8_insert(buffer, '\n', core->cur_pos)) {
+          core->cur_pos++;
+          core->modified = true;
+        }
         break;
       case SDLK_TAB:
         for (int i = 0; i < tabstop; i++) {
           if (!string8_insert(buffer, ' ', core->cur_pos)) break;
           core->cur_pos++;
+          core->modified = true;
         }
         break;
       default: break;
     }
+  } else if (core->mode == MODE_COMMAND) {
+    tex_command_input(state, key);
   } else {
     if (key >= SDLK_0 && key <= SDLK_9 && !(event->key.keysym.mod & (KMOD_CTRL | KMOD_SHIFT))) {
       int digit = (int)(key - SDLK_0);
@@ -922,6 +1190,14 @@ static void tex_input_handle(struct state_T* state, const SDL_Event* event) {
             core->cur_pos = p < end ? p : tex_normal_limit(buffer, p);
           } break;
           case SDLK_4: if (event->key.keysym.mod & KMOD_SHIFT) core->cur_pos = tex_normal_limit(buffer, core->cur_pos); break;
+          case SDLK_COLON: case SDLK_SEMICOLON:
+            if (key == SDLK_COLON || (event->key.keysym.mod & KMOD_SHIFT)) {
+              core->mode = MODE_COMMAND;
+              core->command.size = 0;
+              core->command.data[0] = '\0';
+              core->suppress_text_input = true;
+            }
+            break;
           case SDLK_i:
             if (event->key.keysym.mod & KMOD_SHIFT) {
               core->cur_pos = tex_line_start(buffer, core->cur_pos);
@@ -1047,6 +1323,7 @@ static void tex_render(struct state_T* state) {
     end = start;
   }
 
+  tex_status_draw(state);
   tex_cursor_draw(state);
   SDL_RenderPresent(state->renderer);
 }
