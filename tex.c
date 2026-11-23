@@ -712,7 +712,7 @@ static void tex_window_init(struct state_T* state) {
   }
 
   state->font = TTF_OpenFont(
-    "/home/user/dev/tex/IosevkaNerdFont-Regular.ttf",
+    "IosevkaNerdFont-Regular.ttf",
     font_size
   );
 
